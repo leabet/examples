@@ -1,0 +1,855 @@
+apply plugin: 'com.android.application'
+ext {
+    officialRelease = true;
+	string1 = "Hello there!"
+	curlResult = ""
+	jiraVersionName = "1.0.0"
+	testfairyApiServer = "https://app.testfairy.com"
+	jiraVersionID = "123"
+	jiraProjectID = "456"
+	gitHash="789"
+	jiraBaseURL = "https://jira5.mobitv.corp"
+	jiraProjectKey = "NMA"
+	mobiTvFileServer = "http://msotv-stage.mobitv.com:1059/android/DongleMobileApp"
+}
+android {
+    compileSdkVersion 21
+    buildToolsVersion '22.0.1'
+
+    defaultConfig {
+        applicationId "com.example.jjung.helloworldwithflavor"
+        minSdkVersion 19
+        targetSdkVersion 19
+        versionCode 1
+        versionName "1.0"
+    }
+	
+    signingConfigs {
+        release {
+            storeFile file("keystore/android-release.keystore")
+            storePassword "android-release"
+            keyAlias "android-release"
+            keyPassword "android-release"
+        }
+    }
+
+	
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+		// use the flavor setting for debug
+        debug {
+            buildConfigField "boolean", "STETHO_ENABLED", "true"
+            signingConfig null
+        }
+    }
+
+    productFlavors {
+        flavor1 {
+            applicationId "com.flavor1.helloworld"
+			signingConfig signingConfigs.release
+        }
+        flavor2 {
+            applicationId "com.flavor2.helloworld"
+        }
+    }
+
+}
+android.applicationVariants.each {variant ->
+	println 'variant each:'+variant
+}
+
+// android.applicationVariants is type of DefaultDomainObjectSet<ApplicationVariant> and
+//'.all' should be called to iterate them 'all'
+android.applicationVariants.all { variant ->
+    def variantFlavorName = variant.flavorName
+    def variantBuildTypeName = variant.buildType.name
+
+	logger.warn('{} - {}', variantFlavorName, variantBuildTypeName)
+	variant.mergeResources << {
+		logger.warn('==================mergeResource done')
+	}
+	
+    variant.mergeResources.doFirst {
+        // if this is officialRelease, add officialbuild-only resource id-values to 'release' buildType.
+        // we cannot add this to 'flavor' level if we're overriding existing resource ids which will report 'duplicated' resource error.
+        // so using higher priority level in terms of 'merging resource' steps, which is buildType,
+        logger.warn('======== variant.mergeResources.doFirst====')
+        if (officialRelease) {
+            if (variantFlavorName.equalsIgnoreCase('flavor1')) {
+                android.sourceSets.release.resources.srcDirs = ['src/releaseofficial/flavor1/res']
+                android.sourceSets.debug.resources.srcDirs = ['src/releaseofficial/flavor1/res']
+            }
+            logger.warn('{}',android.sourceSets.debug.resources)
+        }
+    }
+	variant.assemble << {
+		logger.warn('========assemble doLast'.capitalize())
+	}
+}
+
+
+
+
+tasks.whenTaskAdded { task ->
+	android.applicationVariants.all { variant ->
+		def variantFlavorName = variant.flavorName
+		def variantBuildTypeName = variant.buildType.name
+			if (task.name.equalsIgnoreCase("package${variantFlavorName}${variantBuildTypeName}")) {
+				logger.warn('====package task:{} found', task.name)
+				task.doLast {
+					logger.warn(" ====package task : {} doLast", task.name)
+				}
+			}
+	}
+}
+import groovy.json.*
+import java.nio.file.*
+import java.util.zip.*
+
+
+class packageTaskListener implements TaskExecutionListener {
+	final def STRIP_SIGNATURE_SUFFIX = "-stripped-signing"
+
+	Project mProject
+	packageTaskListener(Project project) {
+		mProject = project
+	}
+	
+  void afterExecute(Task t,TaskState s) {
+	if (mProject.hasProperty('android')) {
+		def android = mProject['android']
+			android.applicationVariants.all { variant ->
+			////////after 'assembleXXXXyyyy' 
+			def variantOutFile = outputs[0].outputFile
+			def variantFlavorName = variant.flavorName
+			def variantBuildTypeName = variant.buildType.name
+			def flavor = variantFlavorName.toLowerCase()
+			def sprintSigningRequired = (flavor.equals("flavor1") || flavor.equals("boost")) && !variant.isSigningReady()
+			
+			if (t.name.equalsIgnoreCase("assemble${variantFlavorName}${variantBuildTypeName}")) {
+			def logger = mProject.logger
+			
+			def apiKey = "f91dcff02756832e0d8ed8f8937082a162ae7ff4"
+			
+			// sign with sprintdd
+			if (sprintSigningRequired) {
+				def signedApkPath = signWithSprintDD(variantOutFile)
+				if (signedApkPath) {
+					variantOutFile = new File(signedApkPath)
+				}
+			}
+			
+			// write releaseNote first
+			if (mProject.jiraVersionID) {
+				def apkFileName = variantOutFile.name
+				def outputFileName = variantOutFile.parent + "/releaseNote" // file extension is added in writeRelease methods.
+				writeReleaseNote(variantBuildTypeName, variantFlavorName, apkFileName, outputFileName)
+			}
+			
+			if (apiKey) {
+				processTestfairy(variant, apiKey, sprintSigningRequired)
+			}
+
+/*
+logger.warn ('package task:{} executed',t.name) 
+logger.warn ('for flavor:{} and buildtype:{}',variantFlavorName, variantBuildTypeName)
+variant.outputs.each { output ->
+	logger.warn ('for outputs:{}',output.outputFile)
+}
+// proguard mapping file ?
+if (variant.buildType.isMinifyEnabled()) {
+	def mappingFile = variant.getMappingFile()
+	logger.warn("this is minifyEnabled true: location:{} in {}", mappingFile.name, mappingFile.parent)
+}
+def argsList = []
+argsList.add("/c")
+	argsList<< "dir" << "/w"
+
+mProject.exec {
+	executable 'cmd'
+	args argsList
+}*/
+				
+					
+			}
+		}
+	  }
+  }
+
+  void beforeExecute(Task t) {
+
+  }
+/**
+     * Upload apk file to testfairy.
+     * if the apk file is already 'signed', stripped out the signature, upload the apk file to testfairy, get necessary instrument files and
+     * resign it with same way locally then upload it again.
+     *
+     */
+    private void processTestfairy(variant, testfairyApiKey, boolean sprintSigningRequired) {
+        def logger = mProject.logger
+        def apiServer = mProject.testfairyApiServer
+        def apiKey = testfairyApiKey
+        def apkPath = variant.outputs[0].outputFile.path
+        def apkFolder = variant.outputs[0].outputFile.parent
+        def variantFlavorName = variant.flavorName
+        def variantBuildTypeName = variant.buildType.name
+
+        def mappingFilePath = ""
+        def instrumentedUrl = "" // 'unsigned' but testfairy-module attached apk file.
+
+        if (variant.buildType.isMinifyEnabled()) {
+            mappingFilePath = variant.getMappingFile().path
+        }
+
+        def unsigned = !variant.isSigningReady()
+        // unfortunately, testfairy doesn't provide api to setup apk file name -
+        // it uses whatever the name that first uploaded. So create temporary apk file with named without 'unsigned'
+        // the temporary file will be removed once apk file is uploaded.
+        def apkTempPath = ""
+        if (unsigned && apkPath.endsWith("-unsigned.apk")) {
+            apkTempPath = apkPath.replace("-unsigned.apk", ".apk")
+            // copy apkPath to apkTempPath
+            java.nio.file.Files.copy(Paths.get(apkPath), Paths.get(apkTempPath), StandardCopyOption.REPLACE_EXISTING)
+            apkPath = apkTempPath
+        }
+        def jsonResponse = uploadApkToTestfairy(apiKey, apkPath, mappingFilePath, false)
+        def testfairyUrl = ""
+
+        if (jsonResponse != null) { // non-null returned value confirmed the server sent 'ok' status
+            instrumentedUrl = jsonResponse.get("instrumented_url")
+            testfairyUrl = jsonResponse.get("build_url")
+        } else {
+            logger.warn("failed to upload the apk file - curlResult:\n{}", mProject.curlResult)
+            return
+        }
+
+        // delete 'temporary apk file'
+        if (apkTempPath) {
+            java.nio.file.Files.deleteIfExists(Paths.get(apkTempPath))
+        }
+
+        // if the given apk file doesn't need a sprint signature or not signed.
+        if (unsigned && !sprintSigningRequired) {
+            // we don't need to do any further. write testfairy url to releaseNote.
+			def outputFileName = apkFolder + "/releaseNote" // file extension is added in writeRelease methods.
+            writeTestFairyUrlReleaseNote(variantBuildTypeName, variantFlavorName, testfairyUrl, outputFileName)
+            return
+        }
+
+        // downloaded instrumentedFile-apk from testfairy server, resign it locally and upload the signed apk again.
+        def argsList = []
+        def errOutput = new ByteArrayOutputStream()
+        def instrumentedFileName =  "${apkFolder}/instrumented-${variantFlavorName}-${variantBuildTypeName}-${mProject.jiraVersionName}-unsigned.apk"
+        argsList << "-k" << "-L" // -k: accept insecure ssl, -L: follow redirected url
+        argsList << "--user-agent" << "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\""
+        argsList << "-o" << instrumentedFileName
+        argsList << instrumentedUrl
+        try {
+            mProject.exec {
+                executable 'curl'
+                args argsList
+                errorOutput = errOutput
+            }
+        } catch (Exception e) {
+            logger.warn("failed to download instrumented file : {} from testfairy server:\n {}", instrumentedUrl, errOutput.toString())
+        }
+
+		def instrumentedNewFileName = instrumentedFileName.replace(".apk", "${STRIP_SIGNATURE_SUFFIX}.apk")
+		
+		// strip out any existing signature 
+		def instrumentedFile
+		if (stripSignatureFromApk(instrumentedFileName, instrumentedNewFileName)) {
+			logger.warn("successfully created new file:{}", instrumentedNewFileName)
+			instrumentedFile = new File(instrumentedNewFileName)
+		} else {
+			logger.warn("failed to create new file:{} from {}", instrumentedNewFileName, instrumentedFileName)
+			instrumentedFile = new File(instrumentedFileName)
+		}
+		
+		if (!instrumentedFile.exists()) {
+            logger.warn("cannot access instrumented file:{}", instrumentedFileName)
+            return
+        }
+        def signedTestfairyApkFileName = ""
+        if (unsigned && sprintSigningRequired) {
+		    signedTestfairyApkFileName = signWithSprintDD(instrumentedFile)
+        } else {
+			// get the signing config from variant.
+			signedTestfairyApkFileName = signWithSigningConfig(instrumentedFile, variant.signingConfig)
+		}
+		
+		logger.warn("----- signedTestfairyApkFileName:{}", signedTestfairyApkFileName)
+		// verify signature? 
+		
+        // upload signed apk to testfairy server
+        jsonResponse = uploadApkToTestfairy(apiKey, signedTestfairyApkFileName, mappingFilePath, true)
+
+        if (jsonResponse != null) {
+            testfairyUrl = jsonResponse.get("build_url")
+			def outputFileName = apkFolder + "/releaseNote" // file extension is added in writeRelease methods.
+            writeTestFairyUrlReleaseNote(variantBuildTypeName, variantFlavorName, testfairyUrl, outputFileName)
+			// delete uploaded apk file - uncomment line below if we need to save space on build machine.
+			//new File(signedTestfairyApkFileName).delete()
+        }
+    }  
+  
+    /**
+     * Sign the given apk file with local certificate 
+     *
+     * @param apkPath apk file to be signed
+     * @param signingConfig signing config from variant 
+     * @return String signed apk file - same as apkPath if successful
+     */
+    private String signWithSigningConfig(File apkFile, signingConfig) {
+		def jarSignerPath = "$System.env.JAVA_HOME/bin/jarsigner"
+		def argsList = []
+		def apkFilePath = apkFile.path
+		def outStream = new ByteArrayOutputStream()
+		def errStream = new ByteArrayOutputStream()
+		argsList << "-keystore" << signingConfig.storeFile
+		argsList << "-storepass" << signingConfig.storePassword
+		argsList << "-keypass" << signingConfig.keyPassword
+		argsList << "-digestalg" << "SHA1"
+		argsList << "-sigalg" << "MD5withRSA"
+		argsList << apkFilePath << signingConfig.keyAlias
+		try {
+			mProject.exec {
+				executable jarSignerPath
+				args argsList
+				standardOutput = outStream
+				errorOutput = errStream
+			}
+			mProject.logger.warn("jarSigner: output:{}", outStream.toString())
+			mProject.logger.warn("jarSigner: errOutput:{}", errStream.toString())
+			// zipalign apk file. 
+			def apkTempPath = apkFilePath.replace(".apk", "-unaligned.apk")
+            // copy apkPath to apkTempPath
+            java.nio.file.Files.copy(Paths.get(apkFilePath), Paths.get(apkTempPath), StandardCopyOption.REPLACE_EXISTING)
+			
+			if (zipAlignApk(apkTempPath, apkFilePath)) {
+				// remove unnecessary file
+				new File(apkTempPath).delete()
+				return apkFilePath
+			}
+        } catch (Exception e) {
+			mProject.logger.warn("jarSigner: Exception:{}", e.toString())
+		}
+		return null
+	}	
+	
+	private boolean zipAlignApk(String srcApkPath, String destApkPath) {
+		def zipAlignPath = "$System.env.ANDROID_HOME/build-tools/$mProject.android.buildToolsVersion/zipalign"
+		def outStream = new ByteArrayOutputStream()
+		def errStream = new ByteArrayOutputStream()
+		try {
+			mProject.exec {
+				executable zipAlignPath
+				args "-f","4", srcApkPath, destApkPath
+				standardOutput = outStream
+				errorOutput = errStream
+			}
+			mProject.logger.warn("zipAlign: inputFile: {} outputFile:{}", srcApkPath, destApkPath)
+			mProject.logger.warn("zipAlign: output:{}",outStream.toString())
+			mProject.logger.warn("zipAlign: errOutput:{}", errStream.toString())
+			return true
+		} catch (Exception e) {
+			mProject.logger.warn("zipAlign: Exception:{}", e.toString())
+		}
+		return false
+	}
+  
+	/**
+	 * Upload apk file to testfairy server
+	 *
+	 * @param apiKey testfairy api keyAlias
+	 * @param apiFilePath apk file path to be uploaded
+	 * @param mappingFilePath mapping file if it has been 'minified' 
+	 * @param isSignedUpload true if this upload is locally 'resigned' instrumented apk file. 
+	 * @return 'JSON' data structure parsed by JsonSlurper
+	 */
+	private def uploadApkToTestfairy(String apiKey, String apkFilePath, String mappingFilePath, boolean isSignedUpload) {
+	// let apiServer configurable? 
+		def apiServer = "https://app.testfairy.com"
+		def argsList = []
+		// mandatory parameters
+		argsList << "-k" 
+			argsList << "--user-agent" << "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\""
+			argsList << "-F" << "api_key=${apiKey}"
+			argsList << "-F" << "apk_file=@${apkFilePath}"
+		// conditional params... : http://docs.testfairy.com/API/Upload_API.html
+		if (mappingFilePath) {
+			argsList << "-F" << "symbols_file=@${mappingFilePath}"
+		}
+		// finally, testfairy api server + upload endpoint.
+		argsList << (isSignedUpload ? "${apiServer}/api/upload-signed" : "${apiServer}/api/upload")
+		def baos = new ByteArrayOutputStream()
+		def errOutput = new ByteArrayOutputStream()
+		try {
+			mProject.exec {
+				executable 'curl'
+				args argsList
+				standardOutput = baos
+				errorOutput = errOutput
+			}
+			// backup standard output result to mProject.curlResult
+			mProject.curlResult = baos.toString()
+			baos.reset()
+			def jsonResponse = new JsonSlurper().parseText(mProject.curlResult)
+			if (jsonResponse != null) {
+				if ("ok".equalsIgnoreCase(jsonResponse.get("status"))) {
+					return jsonResponse
+				}
+			}
+		} catch (Exception e) {
+			mProject.logger.warn("exception during uploading apk to testfairy: \n{}", e.toString())
+			mProject.logger.warn("error message: \n{}", errOutput.toString()) 
+			mProject.logger.warn("args: \n{}", argsList) 
+		}
+		return null
+	}
+
+/**
+ * strip signature files - under "META-INF" of root folder of the source apk and save it to destination apk.
+ */	
+	private boolean stripSignatureFromApk(String srcApkPath, String destApkPath) {
+		ZipInputStream zipSrc = new ZipInputStream(new FileInputStream(srcApkPath))
+		ZipOutputStream zipDest = new ZipOutputStream(new FileOutputStream(destApkPath))
+		byte[] buffer = new byte[1024] 
+		try {
+			def entry = zipSrc.getNextEntry()
+			while (entry) {
+				if (!entry.name.startsWith("META-INF/")) {
+					zipDest.putNextEntry(new ZipEntry(entry))
+					int length = 0
+					while ((length = zipSrc.read(buffer)) > 0) {
+						zipDest.write(buffer, 0, length)
+					}
+					zipDest.closeEntry()
+				}
+				entry = zipSrc.getNextEntry()
+			}
+			zipDest.close()
+			zipSrc.close()
+			return true
+		} catch (Exception e) {
+			mProject.logger.warn("Exception caught during stripSignatureFromApk: \n{}", e.toString())
+		}
+		return false
+	}
+	
+    /**
+     * Sign the given apk file with certificate from SprintDD
+     *
+     * @param apkPath apk file to be signed
+     * @param variant signed apk file downloaded from SprintDD
+     * @return 'signed' file path. null if failed.
+     */
+    private String signWithSprintDD(File apkFile) {
+        def apkPath = apkFile.path
+        def signedUnalignedApkPath = apkPath.replace("-unsigned", "-signed-unaligned")
+		signedUnalignedApkPath = signedUnalignedApkPath.replace(STRIP_SIGNATURE_SUFFIX,"")
+        def signedApkPath = signedUnalignedApkPath.replace("-signed-unaligned.apk", "-signed.apk")
+        def logger = mProject.logger
+        // First, login to the sprint dd site.
+        def errOutput = new ByteArrayOutputStream()
+        def cookieFilePath = apkFile.parent + "/cookie-jar.txt"
+        def cookieFile = new File(cookieFilePath)
+        def validCookie = true // by default, if cookie file exists,
+        try {
+            // check whether it has cookie-jar.txt file on project folder : if it exists,
+            // don't need to log-in to get cookie. This session cookie shouldn't be expired
+            // during each buildtype(debug/release) per flavor.
+            if (cookieFile.exists()) {
+                // check validation - if created more than three hours ago, set it as invalidated
+                if (Calendar.getInstance().getTime().getTime() - cookieFile.lastModified() >  3*60*60*1000) {
+                    logger.warn("Existing cookie may be expired. Refreshing it...")
+                    validCookie = false
+                }
+            }
+
+            if (!cookieFile.exists() || !validCookie) {
+                def credentialData = "request=insert&type=login&login=$mProject.SPRINTDD_USERNAME&password=$mProject.SPRINTDD_PASSWORD&site=main"
+                def baos = new ByteArrayOutputStream()
+
+                mProject.exec {
+                    executable 'curl'
+                    args "-k", "--cookie-jar", cookieFilePath, "--user-agent", "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\"", "--referer", "\"https://database.sprintdd.com/index.php?page=tools&tab=%23ApkSignSection\"",\
+            "-H", "\"Accept: application/json\"","-X","POST","-d", credentialData, "https://database.sprintdd.com/include/ajax.php"
+                    standardOutput = baos
+                    errorOutput = errOutput
+                }
+                mProject.curlResult = baos.toString() // json response should contain 'success'
+                if (!mProject.curlResult.contains("success")) {
+                    validCookie = false
+                    // delete the invalid cookie file and print warning about invalid credential.
+                    new File(cookieFilePath).delete()
+                    logger.warn("Invalid session cookie received. Did you set valid SPRINTDD_USERNAME and SPRINTDD_PASSWORD properties?")
+                    logger.warn("error:" + errOutput.toString())
+                } else {
+                    validCookie = true
+                }
+            }
+            if (validCookie) {
+                // Once we got a valid cookie, submit unsigned apk file to the server.
+                mProject.exec {
+                    executable 'curl'
+                    args "-k", "--cookie", cookieFilePath, "--user-agent", "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\"", "--referer", "\"https://database.sprintdd.com/tools/\"","-H","DNT: 1", "-F","uploadAPK=@"+ apkPath, "-F","upload=1",\
+                "-F", "certSelect=APKSign.sprint.new",\
+                "-o", signedUnalignedApkPath, "https://database.sprintdd.com/include/sign.apk.php"
+                    errorOutput = errOutput
+                }
+
+                def zipAlignPath = "$System.env.ANDROID_HOME/build-tools/$mProject.android.buildToolsVersion/zipalign"
+                mProject.exec {
+                    executable zipAlignPath
+                    args "-f","4",signedUnalignedApkPath, signedApkPath
+                    errorOutput = errOutput
+                }
+				// remove temporary file. 
+				new File(signedUnalignedApkPath).delete()
+                return signedApkPath
+            }
+        } catch (org.gradle.process.internal.ExecException e) {  // 'curl' may not be installed on system.
+            logger.warn('ExecException occurs wihle running curl. Please verify curl installed on your system to get apk file signed by SprintDD')
+            // delete cookieFile if exists - it may be expired.
+            if (cookieFile?.exists()) {
+                cookieFile.delete()
+            }
+            logger.warn("error:"+errOutput.toString())
+            return null
+        } finally {
+            errOutput.close()
+            errOutput = null
+        }
+    }
+
+    /**
+     * Write release note file with three format : regular text, MD and JIRA-text formatting notation.
+     *
+     */
+    private void writeReleaseNote(String typeName, String flavorName, String apkFileName, String releaseFileName) {
+        // write down markdown type releaseNote
+        mProject.writeReleaseNoteMD(typeName, flavorName, mProject.jiraVersionName, apkFileName, releaseFileName)
+        // write down text type releaseNote
+        mProject.writeReleaseNoteTXT(typeName, flavorName, mProject.jiraVersionName, apkFileName, releaseFileName)
+        // write down text-formatting-notation for jira releaseNote
+        mProject.writeReleaseNoteTFN(typeName, flavorName, mProject.jiraVersionName, apkFileName, releaseFileName)
+    }
+	
+	private void writeTestFairyUrlReleaseNote(String typeName, String flavorName, String buildUrl, String releaseFileName) {
+		// write down markdown type releaseNote
+        mProject.writeTestFairyUrlReleaseNoteMD(typeName, flavorName, buildUrl, releaseFileName)
+        // write down text type releaseNote
+        mProject.writeTestFairyUrlReleaseNoteTXT(typeName, flavorName, buildUrl, releaseFileName)
+        // write down text-formatting-notation for jira releaseNote
+        mProject.writeTestFairyUrlReleaseNoteTFN(typeName, flavorName, buildUrl, releaseFileName)
+	}
+}
+
+gradle.addListener(new packageTaskListener(project))
+
+task hello << {
+	println string1
+	def java_loc = System.getProperty("org.gradle.java.home")
+	println "java_loc:"+java_loc
+	println "$System.env.JAVA_HOME"
+	
+	def apkFilePath = "${getProjectDir()}/build/outputs/apk/app-flavor1-release.apk"
+	def apkNewFilePath = apkFilePath.replace(".apk", "-aligned.apk")
+	zipAlignApk(apkFilePath, apkNewFilePath)
+	
+}
+
+	def zipAlignApk(String srcApkPath, String destApkPath) {
+		def zipAlignPath = "$System.env.ANDROID_HOME/build-tools/$android.buildToolsVersion/zipalign"
+		def outStream = new ByteArrayOutputStream()
+		def errStream = new ByteArrayOutputStream()
+		try {
+			exec {
+				executable zipAlignPath
+				args "-f","4",srcApkPath, destApkPath
+				standardOutput = outStream
+				errorOutput = errStream
+			}
+			logger.warn("zipAlign: output:{}",outStream.toString())
+			logger.warn("zipAlign: errOutput:{}", errStream.toString())
+			
+			return true
+		} catch (Exception e) {
+			logger.warn("zipAlign: Exception:{}", e.toString())
+		}
+		return false
+	}
+	
+/*
+task stripSignatureFromApk << {
+	def apkFilePath = "${getProjectDir()}/build/outputs/apk/app-flavor1-release.apk"
+	def apkNewFilePath = apkFilePath.replace(".apk", "${STRIP_SIGNATURE_SUFFIX}.apk")
+	
+	ZipInputStream zipSrc = new ZipInputStream(new FileInputStream(apkFilePath))
+	ZipOutputStream zipDest = new ZipOutputStream(new FileOutputStream(apkNewFilePath))
+	byte[] buffer = new byte[1024]
+	def entry = zipSrc.getNextEntry()
+	while (entry) {
+	if (!entry.name.startsWith("META-INF/")) {
+		logger.warn("--entryName:{}",entry.name)
+			zipDest.putNextEntry(new ZipEntry(entry))
+			int length = 0
+			while ((length = zipSrc.read(buffer)) > 0) {
+				zipDest.write(buffer, 0, length)	
+			}
+			zipDest.closeEntry()
+		}
+		entry = zipSrc.getNextEntry()
+	}
+	zipDest.close()
+	zipSrc.close()
+}
+*/
+dependencies {
+    compile fileTree(include: ['*.jar'], dir: 'libs')
+    compile 'com.android.support:appcompat-v7:22.2.1'
+    compile 'com.android.support:support-v13:22.2.1'
+}
+
+def createTinyURL(url) {
+	return "http://tinyurl.com/=="
+}
+
+/**
+ * Write down testfairy url to releaseNote 'markdown' version
+ */
+def writeTestFairyUrlReleaseNoteMD(String variantBuildType, String variantBuildFlavor, String testfairyUrl, String outputFileName) {
+    def buildtype = variantBuildType.toLowerCase()
+    def flavor = variantBuildFlavor.toLowerCase()
+	def tinyurl = createTinyURL(testfairyUrl)
+	// releaseNote 'header' should be prepared already. 
+    def releaseNoteFile = new File(outputFileName+".md")
+    releaseNoteFile.withWriterAppend { writer ->
+        writer.writeLine("|**testfairy $flavor**|$buildtype|$testfairyUrl|$tinyurl|")
+    }
+}
+
+/**
+ * Write down testfairy url to releaseNote 'Text formatting notation' for jira version
+ */
+def writeTestFairyUrlReleaseNoteTFN(String variantBuildType, String variantBuildFlavor, String testfairyUrl, String outputFileName) {
+    def buildtype = variantBuildType.toLowerCase()
+    def flavor = variantBuildFlavor.toLowerCase()
+	def tinyurl = createTinyURL(testfairyUrl)
+	// releaseNote 'header' should be prepared already. 
+    def releaseNoteFile = new File(outputFileName+".jira")
+    releaseNoteFile.withWriterAppend { writer ->
+		writer.writeLine("|*testfairy $flavor*|$buildtype|$testfairyUrl|$tinyurl|")
+    }
+}
+
+/**
+ * Write down testfairy url to releaseNote 'text' version
+ */
+def writeTestFairyUrlReleaseNoteTXT(String variantBuildType, String variantBuildFlavor, String testfairyUrl, String outputFileName) {
+    def buildtype = variantBuildType.toLowerCase()
+    def flavor = variantBuildFlavor.toLowerCase()
+	def tinyurl = createTinyURL(testfairyUrl)
+	// releaseNote 'header' should be prepared already. 
+    def releaseNoteFile = new File(outputFileName+".txt")
+    releaseNoteFile.withWriterAppend { writer ->
+		writer.writeLine("")
+		writer.writeLine("flavor: $flavor")
+        writer.writeLine("testfairy $buildtype : $testfairyUrl")
+        writer.writeLine("tinyurl : $tinyurl")
+    }
+}
+
+/**
+ * Write down releaseNote 'markdown' version
+ */
+def writeReleaseNoteMD(String variantBuildType, String variantBuildFlavor, String versionName, String apkFileName, String outputFileName) {
+    def buildtype = variantBuildType.toLowerCase()
+    def flavor = variantBuildFlavor.toLowerCase()
+    def fileServerURL = "$mobiTvFileServer/$flavor/$buildtype/$apkFileName"
+    def tinyurl = createTinyURL(fileServerURL)
+    def releaseNoteLink = "$jiraBaseURL/secure/ReleaseNote.jspa?projectId=$jiraProjectID&version=$jiraVersionID"
+
+    def releaseNoteFile = new File(outputFileName+".md")
+    if (!releaseNoteFile.exists()) {
+        // if the file doesn't exist, write down header part including
+        // release note link and flavor name and jira version name.
+        def wifiVersion,sdkVersion
+        def flavorCompileName = flavor+'Compile'
+        try {
+            // search wifi version and sdk version from 'compile' dependencies in configurations
+            configurations.each { conf ->
+                def confName = conf.getName()
+                if (confName.contains('compile') || confName.contains(flavorCompileName)) {
+                    conf.dependencies?.each { dependency ->
+                        if (dependency.group == 'com.mobitv.connect.sdk') {
+                            sdkVersion = dependency.version
+                        }
+                        if (dependency.group == 'com.mobitv.client.wifisetup') {
+                            wifiVersion = dependency.version
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn('Exception thrown while getting library version:' + e)
+        }
+
+        releaseNoteFile.withWriter { writer ->
+            writer.writeLine("## Build Notification:")
+            if (sdkVersion?.trim()) {
+                writer.writeLine("### Android Controller SDK: " + sdkVersion)
+            }
+            if (wifiVersion?.trim()) {
+                writer.writeLine("### Wifi Setup: " + wifiVersion)
+            }
+            if (!jiraVersionID.isEmpty()) {
+                writer.writeLine("#### Release Note : $releaseNoteLink")
+                writer.writeLine("#### Version : $versionName")
+            }
+            writer.writeLine("#### Git Hash : $gitHash")
+            writer.writeLine("")
+            // create a table header for builds.
+            writer.writeLine("|Flavor|Build Type|Server Url|TinyUrl|")
+            writer.writeLine("|---|---|---|---|")
+        }
+    }
+    // append apk file location on mobitv server and tiny url for that.
+    releaseNoteFile.withWriterAppend { writer ->
+        writer.writeLine("|**$flavor**|$buildtype|$fileServerURL|$tinyurl|")
+    }
+}
+
+/**
+ * Write down releaseNote 'Text formatting notation' for jira version
+ */
+def writeReleaseNoteTFN(String variantBuildType, String variantBuildFlavor, String versionName, String apkFileName, String outputFileName) {
+    def buildtype = variantBuildType.toLowerCase()
+    def flavor = variantBuildFlavor.toLowerCase()
+    def fileServerURL = "$mobiTvFileServer/$flavor/$buildtype/$apkFileName"
+    def tinyurl = createTinyURL(fileServerURL)
+    def releaseNoteLink = "$jiraBaseURL/secure/ReleaseNote.jspa?projectId=$jiraProjectID&version=$jiraVersionID"
+
+    def releaseNoteFile = new File(outputFileName+".jira")
+    if (!releaseNoteFile.exists()) {
+        // if the file doesn't exist, write down header part including
+        // release note link and flavor name and jira version name.
+        def wifiVersion,sdkVersion
+        def flavorCompileName = flavor+'Compile'
+        try {
+            // search wifi version and sdk version from 'compile' dependencies in configurations
+            configurations.each { conf ->
+                def confName = conf.getName()
+                if (confName.contains('compile') || confName.contains(flavorCompileName)) {
+                    conf.dependencies?.each { dependency ->
+                        if (dependency.group == 'com.mobitv.connect.sdk') {
+                            sdkVersion = dependency.version
+                        }
+                        if (dependency.group == 'com.mobitv.client.wifisetup') {
+                            wifiVersion = dependency.version
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn('Exception thrown while getting library version:' + e)
+        }
+
+        releaseNoteFile.withWriter { writer ->
+            writer.writeLine("h2. Build Notification:")
+            if (sdkVersion?.trim()) {
+                writer.writeLine("h3. Android Controller SDK: " + sdkVersion)
+            }
+            if (wifiVersion?.trim()) {
+                writer.writeLine("h3. Wifi Setup: " + wifiVersion)
+            }
+            if (!jiraVersionID.isEmpty()) {
+                writer.writeLine("h4. Release Note : $releaseNoteLink")
+                writer.writeLine("h4. Version : $versionName")
+            }
+            writer.writeLine("h4. Git Hash : $gitHash")
+            writer.writeLine("")
+            // create a table header for builds.
+            writer.writeLine("||Flavor||Build Type||Server Url||TinyUrl||")
+        }
+    }
+    // append apk file location on mobitv server and tiny url for that.
+    releaseNoteFile.withWriterAppend { writer ->
+        writer.writeLine("|*$flavor*|$buildtype|$fileServerURL|$tinyurl|")
+    }
+}
+
+/**
+ * Write down releaseNote 'text' version
+ */
+def writeReleaseNoteTXT(String variantBuildType, String variantBuildFlavor, String versionName, String apkFileName, String outputFileName) {
+    def buildtype = variantBuildType.toLowerCase()
+    def flavor = variantBuildFlavor.toLowerCase()
+    def fileServerURL = "$mobiTvFileServer/$flavor/$buildtype/$apkFileName"
+    def tinyurl = createTinyURL(fileServerURL)
+    def releaseNoteLink = "$jiraBaseURL/secure/ReleaseNote.jspa?projectId=$jiraProjectID&version=$jiraVersionID"
+    def isAllFlavor = versionName.contains(".all")
+
+    def releaseNoteFile = new File(outputFileName+".txt")
+    if (!releaseNoteFile.exists()) {
+        // if the file doesn't exist, write down header part including
+        // release note link and flavor name and jira version name.
+        def wifiVersion,sdkVersion
+        def flavorCompileName = flavor+'Compile'
+
+        try {
+            // search wifi version and sdk version from 'compile' dependencies in configurations
+            configurations.each { conf ->
+                def confName = conf.getName()
+                if (confName.contains('compile') || confName.contains(flavorCompileName)) {
+                    conf.dependencies?.each { dependency ->
+                        if (dependency.group == 'com.mobitv.connect.sdk') {
+                            sdkVersion = dependency.version
+                        }
+                        if (dependency.group == 'com.mobitv.client.wifisetup') {
+                            wifiVersion = dependency.version
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn('Exception thrown while getting library version:' + e)
+        }
+
+        releaseNoteFile.withWriter { writer ->
+            writer.writeLine("Build Notification:")
+            if (sdkVersion?.trim()) {
+                writer.writeLine("Android Controller SDK: " + sdkVersion)
+            }
+            if (wifiVersion?.trim()) {
+                writer.writeLine("Wifi Setup: " + wifiVersion)
+            }
+            writer.writeLine("----")
+            if (!jiraVersionID.isEmpty()) {
+                if (isAllFlavor) {
+                    writer.writeLine("Version : $versionName")
+                } else {
+                    writer.writeLine("MobiTV $flavor : $versionName")
+                }
+                writer.writeLine("")
+                writer.writeLine("Release Note : $releaseNoteLink")
+                writer.writeLine("")
+            }
+            writer.writeLine("Git Hash: $gitHash")
+            writer.writeLine("")
+        }
+    }
+    // append apk file location on mobitv server and tiny url for that.
+    releaseNoteFile.withWriterAppend { writer ->
+        if (isAllFlavor) {
+            writer.writeLine("")
+            writer.writeLine("flavor: $flavor")
+        }
+        writer.writeLine("$buildtype : $fileServerURL")
+        writer.writeLine("tinyurl : $tinyurl")
+    }
+}
