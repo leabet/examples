@@ -111,7 +111,7 @@ import java.util.zip.*
 
 
 class packageTaskListener implements TaskExecutionListener {
-	final def STRIP_SIGNATURE_SUFFIX = "-stripped-signing"
+	final def STRIP_SIGNATURE_SUFFIX = "-sign-stripped"
 
 	Project mProject
 	packageTaskListener(Project project) {
@@ -133,7 +133,8 @@ class packageTaskListener implements TaskExecutionListener {
 			def logger = mProject.logger
 			
 			def apiKey = "f91dcff02756832e0d8ed8f8937082a162ae7ff4"
-			
+			logger.warn("===project name: {}", mProject.name )
+			/*
 			// sign with sprintdd
 			if (sprintSigningRequired) {
 				def signedApkPath = signWithSprintDD(variantOutFile)
@@ -151,7 +152,7 @@ class packageTaskListener implements TaskExecutionListener {
 			
 			if (apiKey) {
 				processTestfairy(variant, apiKey, sprintSigningRequired)
-			}
+			}*/
 
 /*
 logger.warn ('package task:{} executed',t.name) 
@@ -192,8 +193,9 @@ mProject.exec {
         def logger = mProject.logger
         def apiServer = mProject.testfairyApiServer
         def apiKey = testfairyApiKey
-        def apkPath = variant.outputs[0].outputFile.path
-        def apkFolder = variant.outputs[0].outputFile.parent
+		def apkFile = variant.outputs[0].outoutFile
+        def apkPath = apkFile.path
+        def apkFolder = apkFile.parent
         def variantFlavorName = variant.flavorName
         def variantBuildTypeName = variant.buildType.name
 
@@ -215,7 +217,7 @@ mProject.exec {
             java.nio.file.Files.copy(Paths.get(apkPath), Paths.get(apkTempPath), StandardCopyOption.REPLACE_EXISTING)
             apkPath = apkTempPath
         }
-        def jsonResponse = uploadApkToTestfairy(apiKey, apkPath, mappingFilePath, false)
+        def jsonResponse = mProject.uploadApkToTestfairy(testfairyApiServer, apkPath, mappingFilePath, false)
         def testfairyUrl = ""
 
         if (jsonResponse != null) { // non-null returned value confirmed the server sent 'ok' status
@@ -242,7 +244,8 @@ mProject.exec {
         // downloaded instrumentedFile-apk from testfairy server, resign it locally and upload the signed apk again.
         def argsList = []
         def errOutput = new ByteArrayOutputStream()
-        def instrumentedFileName =  "${apkFolder}/instrumented-${variantFlavorName}-${variantBuildTypeName}-${mProject.jiraVersionName}-unsigned.apk"
+		def apkFileName = apkFile.name.replace(".apk","")
+        def instrumentedFileName = "${apkFolder}/instrumented-${apkFileName}-unsigned.apk"
         argsList << "-k" << "-L" // -k: accept insecure ssl, -L: follow redirected url
         argsList << "--user-agent" << "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\""
         argsList << "-o" << instrumentedFileName
@@ -261,7 +264,7 @@ mProject.exec {
 		
 		// strip out any existing signature 
 		def instrumentedFile
-		if (stripSignatureFromApk(instrumentedFileName, instrumentedNewFileName)) {
+		if (mProject.stripSignatureFromApk(instrumentedFileName, instrumentedNewFileName)) {
 			logger.warn("successfully created new file:{}", instrumentedNewFileName)
 			instrumentedFile = new File(instrumentedNewFileName)
 		} else {
@@ -275,17 +278,17 @@ mProject.exec {
         }
         def signedTestfairyApkFileName = ""
         if (unsigned && sprintSigningRequired) {
-		    signedTestfairyApkFileName = signWithSprintDD(instrumentedFile)
+		    signedTestfairyApkFileName = mProject.signWithSprintDD(instrumentedFile)
         } else {
 			// get the signing config from variant.
-			signedTestfairyApkFileName = signWithSigningConfig(instrumentedFile, variant.signingConfig)
+			signedTestfairyApkFileName = mProject.signWithSigningConfig(instrumentedFile, variant.signingConfig)
 		}
 		
 		logger.warn("----- signedTestfairyApkFileName:{}", signedTestfairyApkFileName)
 		// verify signature? 
 		
         // upload signed apk to testfairy server
-        jsonResponse = uploadApkToTestfairy(apiKey, signedTestfairyApkFileName, mappingFilePath, true)
+        jsonResponse = mProject.uploadApkToTestfairy(apiKey, signedTestfairyApkFileName, mappingFilePath, true)
 
         if (jsonResponse != null) {
             testfairyUrl = jsonResponse.get("build_url")
@@ -296,236 +299,7 @@ mProject.exec {
         }
     }  
   
-    /**
-     * Sign the given apk file with local certificate 
-     *
-     * @param apkPath apk file to be signed
-     * @param signingConfig signing config from variant 
-     * @return String signed apk file - same as apkPath if successful
-     */
-    private String signWithSigningConfig(File apkFile, signingConfig) {
-		def jarSignerPath = "$System.env.JAVA_HOME/bin/jarsigner"
-		def argsList = []
-		def apkFilePath = apkFile.path
-		def outStream = new ByteArrayOutputStream()
-		def errStream = new ByteArrayOutputStream()
-		argsList << "-keystore" << signingConfig.storeFile
-		argsList << "-storepass" << signingConfig.storePassword
-		argsList << "-keypass" << signingConfig.keyPassword
-		argsList << "-digestalg" << "SHA1"
-		argsList << "-sigalg" << "MD5withRSA"
-		argsList << apkFilePath << signingConfig.keyAlias
-		try {
-			mProject.exec {
-				executable jarSignerPath
-				args argsList
-				standardOutput = outStream
-				errorOutput = errStream
-			}
-			mProject.logger.warn("jarSigner: output:{}", outStream.toString())
-			mProject.logger.warn("jarSigner: errOutput:{}", errStream.toString())
-			// zipalign apk file. 
-			def apkTempPath = apkFilePath.replace(".apk", "-unaligned.apk")
-            // copy apkPath to apkTempPath
-            java.nio.file.Files.copy(Paths.get(apkFilePath), Paths.get(apkTempPath), StandardCopyOption.REPLACE_EXISTING)
-			
-			if (zipAlignApk(apkTempPath, apkFilePath)) {
-				// remove unnecessary file
-				new File(apkTempPath).delete()
-				return apkFilePath
-			}
-        } catch (Exception e) {
-			mProject.logger.warn("jarSigner: Exception:{}", e.toString())
-		}
-		return null
-	}	
-	
-	private boolean zipAlignApk(String srcApkPath, String destApkPath) {
-		def zipAlignPath = "$System.env.ANDROID_HOME/build-tools/$mProject.android.buildToolsVersion/zipalign"
-		def outStream = new ByteArrayOutputStream()
-		def errStream = new ByteArrayOutputStream()
-		try {
-			mProject.exec {
-				executable zipAlignPath
-				args "-f","4", srcApkPath, destApkPath
-				standardOutput = outStream
-				errorOutput = errStream
-			}
-			mProject.logger.warn("zipAlign: inputFile: {} outputFile:{}", srcApkPath, destApkPath)
-			mProject.logger.warn("zipAlign: output:{}",outStream.toString())
-			mProject.logger.warn("zipAlign: errOutput:{}", errStream.toString())
-			return true
-		} catch (Exception e) {
-			mProject.logger.warn("zipAlign: Exception:{}", e.toString())
-		}
-		return false
-	}
-  
-	/**
-	 * Upload apk file to testfairy server
-	 *
-	 * @param apiKey testfairy api keyAlias
-	 * @param apiFilePath apk file path to be uploaded
-	 * @param mappingFilePath mapping file if it has been 'minified' 
-	 * @param isSignedUpload true if this upload is locally 'resigned' instrumented apk file. 
-	 * @return 'JSON' data structure parsed by JsonSlurper
-	 */
-	private def uploadApkToTestfairy(String apiKey, String apkFilePath, String mappingFilePath, boolean isSignedUpload) {
-	// let apiServer configurable? 
-		def apiServer = "https://app.testfairy.com"
-		def argsList = []
-		// mandatory parameters
-		argsList << "-k" 
-			argsList << "--user-agent" << "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\""
-			argsList << "-F" << "api_key=${apiKey}"
-			argsList << "-F" << "apk_file=@${apkFilePath}"
-		// conditional params... : http://docs.testfairy.com/API/Upload_API.html
-		if (mappingFilePath) {
-			argsList << "-F" << "symbols_file=@${mappingFilePath}"
-		}
-		// finally, testfairy api server + upload endpoint.
-		argsList << (isSignedUpload ? "${apiServer}/api/upload-signed" : "${apiServer}/api/upload")
-		def baos = new ByteArrayOutputStream()
-		def errOutput = new ByteArrayOutputStream()
-		try {
-			mProject.exec {
-				executable 'curl'
-				args argsList
-				standardOutput = baos
-				errorOutput = errOutput
-			}
-			// backup standard output result to mProject.curlResult
-			mProject.curlResult = baos.toString()
-			baos.reset()
-			def jsonResponse = new JsonSlurper().parseText(mProject.curlResult)
-			if (jsonResponse != null) {
-				if ("ok".equalsIgnoreCase(jsonResponse.get("status"))) {
-					return jsonResponse
-				}
-			}
-		} catch (Exception e) {
-			mProject.logger.warn("exception during uploading apk to testfairy: \n{}", e.toString())
-			mProject.logger.warn("error message: \n{}", errOutput.toString()) 
-			mProject.logger.warn("args: \n{}", argsList) 
-		}
-		return null
-	}
-
-/**
- * strip signature files - under "META-INF" of root folder of the source apk and save it to destination apk.
- */	
-	private boolean stripSignatureFromApk(String srcApkPath, String destApkPath) {
-		ZipInputStream zipSrc = new ZipInputStream(new FileInputStream(srcApkPath))
-		ZipOutputStream zipDest = new ZipOutputStream(new FileOutputStream(destApkPath))
-		byte[] buffer = new byte[1024] 
-		try {
-			def entry = zipSrc.getNextEntry()
-			while (entry) {
-				if (!entry.name.startsWith("META-INF/")) {
-					zipDest.putNextEntry(new ZipEntry(entry))
-					int length = 0
-					while ((length = zipSrc.read(buffer)) > 0) {
-						zipDest.write(buffer, 0, length)
-					}
-					zipDest.closeEntry()
-				}
-				entry = zipSrc.getNextEntry()
-			}
-			zipDest.close()
-			zipSrc.close()
-			return true
-		} catch (Exception e) {
-			mProject.logger.warn("Exception caught during stripSignatureFromApk: \n{}", e.toString())
-		}
-		return false
-	}
-	
-    /**
-     * Sign the given apk file with certificate from SprintDD
-     *
-     * @param apkPath apk file to be signed
-     * @param variant signed apk file downloaded from SprintDD
-     * @return 'signed' file path. null if failed.
-     */
-    private String signWithSprintDD(File apkFile) {
-        def apkPath = apkFile.path
-        def signedUnalignedApkPath = apkPath.replace("-unsigned", "-signed-unaligned")
-		signedUnalignedApkPath = signedUnalignedApkPath.replace(STRIP_SIGNATURE_SUFFIX,"")
-        def signedApkPath = signedUnalignedApkPath.replace("-signed-unaligned.apk", "-signed.apk")
-        def logger = mProject.logger
-        // First, login to the sprint dd site.
-        def errOutput = new ByteArrayOutputStream()
-        def cookieFilePath = apkFile.parent + "/cookie-jar.txt"
-        def cookieFile = new File(cookieFilePath)
-        def validCookie = true // by default, if cookie file exists,
-        try {
-            // check whether it has cookie-jar.txt file on project folder : if it exists,
-            // don't need to log-in to get cookie. This session cookie shouldn't be expired
-            // during each buildtype(debug/release) per flavor.
-            if (cookieFile.exists()) {
-                // check validation - if created more than three hours ago, set it as invalidated
-                if (Calendar.getInstance().getTime().getTime() - cookieFile.lastModified() >  3*60*60*1000) {
-                    logger.warn("Existing cookie may be expired. Refreshing it...")
-                    validCookie = false
-                }
-            }
-
-            if (!cookieFile.exists() || !validCookie) {
-                def credentialData = "request=insert&type=login&login=$mProject.SPRINTDD_USERNAME&password=$mProject.SPRINTDD_PASSWORD&site=main"
-                def baos = new ByteArrayOutputStream()
-
-                mProject.exec {
-                    executable 'curl'
-                    args "-k", "--cookie-jar", cookieFilePath, "--user-agent", "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\"", "--referer", "\"https://database.sprintdd.com/index.php?page=tools&tab=%23ApkSignSection\"",\
-            "-H", "\"Accept: application/json\"","-X","POST","-d", credentialData, "https://database.sprintdd.com/include/ajax.php"
-                    standardOutput = baos
-                    errorOutput = errOutput
-                }
-                mProject.curlResult = baos.toString() // json response should contain 'success'
-                if (!mProject.curlResult.contains("success")) {
-                    validCookie = false
-                    // delete the invalid cookie file and print warning about invalid credential.
-                    new File(cookieFilePath).delete()
-                    logger.warn("Invalid session cookie received. Did you set valid SPRINTDD_USERNAME and SPRINTDD_PASSWORD properties?")
-                    logger.warn("error:" + errOutput.toString())
-                } else {
-                    validCookie = true
-                }
-            }
-            if (validCookie) {
-                // Once we got a valid cookie, submit unsigned apk file to the server.
-                mProject.exec {
-                    executable 'curl'
-                    args "-k", "--cookie", cookieFilePath, "--user-agent", "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\"", "--referer", "\"https://database.sprintdd.com/tools/\"","-H","DNT: 1", "-F","uploadAPK=@"+ apkPath, "-F","upload=1",\
-                "-F", "certSelect=APKSign.sprint.new",\
-                "-o", signedUnalignedApkPath, "https://database.sprintdd.com/include/sign.apk.php"
-                    errorOutput = errOutput
-                }
-
-                def zipAlignPath = "$System.env.ANDROID_HOME/build-tools/$mProject.android.buildToolsVersion/zipalign"
-                mProject.exec {
-                    executable zipAlignPath
-                    args "-f","4",signedUnalignedApkPath, signedApkPath
-                    errorOutput = errOutput
-                }
-				// remove temporary file. 
-				new File(signedUnalignedApkPath).delete()
-                return signedApkPath
-            }
-        } catch (org.gradle.process.internal.ExecException e) {  // 'curl' may not be installed on system.
-            logger.warn('ExecException occurs wihle running curl. Please verify curl installed on your system to get apk file signed by SprintDD')
-            // delete cookieFile if exists - it may be expired.
-            if (cookieFile?.exists()) {
-                cookieFile.delete()
-            }
-            logger.warn("error:"+errOutput.toString())
-            return null
-        } finally {
-            errOutput.close()
-            errOutput = null
-        }
-    }
-
+    
     /**
      * Write release note file with three format : regular text, MD and JIRA-text formatting notation.
      *
@@ -563,26 +337,6 @@ task hello << {
 	
 }
 
-	def zipAlignApk(String srcApkPath, String destApkPath) {
-		def zipAlignPath = "$System.env.ANDROID_HOME/build-tools/$android.buildToolsVersion/zipalign"
-		def outStream = new ByteArrayOutputStream()
-		def errStream = new ByteArrayOutputStream()
-		try {
-			exec {
-				executable zipAlignPath
-				args "-f","4",srcApkPath, destApkPath
-				standardOutput = outStream
-				errorOutput = errStream
-			}
-			logger.warn("zipAlign: output:{}",outStream.toString())
-			logger.warn("zipAlign: errOutput:{}", errStream.toString())
-			
-			return true
-		} catch (Exception e) {
-			logger.warn("zipAlign: Exception:{}", e.toString())
-		}
-		return false
-	}
 	
 /*
 task stripSignatureFromApk << {
@@ -617,6 +371,243 @@ dependencies {
 
 def createTinyURL(url) {
 	return "http://tinyurl.com/=="
+}
+
+
+/**
+     * Sign the given apk file with local certificate 
+     *
+     * @param apkPath apk file to be signed
+     * @param signingConfig signing config from variant 
+     * @return String signed apk file - same as apkPath if successful
+     */
+def signWithSigningConfig(File apkFile, signingConfig) {
+	def jarSignerPath = "$System.env.JAVA_HOME/bin/jarsigner"
+	def argsList = []
+	def apkFilePath = apkFile.path
+	def outStream = new ByteArrayOutputStream()
+	def errStream = new ByteArrayOutputStream()
+	argsList << "-keystore" << signingConfig.storeFile
+	argsList << "-storepass" << signingConfig.storePassword
+	argsList << "-keypass" << signingConfig.keyPassword
+	argsList << "-digestalg" << "SHA1"
+	argsList << "-sigalg" << "MD5withRSA"
+	argsList << apkFilePath << signingConfig.keyAlias
+	try {
+		exec {
+			executable jarSignerPath
+			args argsList
+			standardOutput = outStream
+			errorOutput = errStream
+		}
+		logger.warn("jarSigner: output:{}", outStream.toString())
+		logger.warn("jarSigner: errOutput:{}", errStream.toString())
+		// zipalign apk file. 
+		def apkTempPath = apkFilePath.replace(".apk", "-unaligned.apk")
+		// copy apkPath to apkTempPath
+		java.nio.file.Files.copy(Paths.get(apkFilePath), Paths.get(apkTempPath), StandardCopyOption.REPLACE_EXISTING)
+		
+		if (zipAlignApk(apkTempPath, apkFilePath)) {
+			// remove unnecessary file
+			new File(apkTempPath).delete()
+			return apkFilePath
+		}
+	} catch (Exception e) {
+		logger.warn("jarSigner: Exception:{}", e.toString())
+	}
+	return null
+}	
+
+def zipAlignApk(String srcApkPath, String destApkPath) {
+	def zipAlignPath = "$System.env.ANDROID_HOME/build-tools/$android.buildToolsVersion/zipalign"
+	def outStream = new ByteArrayOutputStream()
+	def errStream = new ByteArrayOutputStream()
+	try {
+		exec {
+			executable zipAlignPath
+			args "-f","4", srcApkPath, destApkPath
+			standardOutput = outStream
+			errorOutput = errStream
+		}
+		logger.warn("zipAlign: inputFile: {} outputFile:{}", srcApkPath, destApkPath)
+		logger.warn("zipAlign: output:{}",outStream.toString())
+		logger.warn("zipAlign: errOutput:{}", errStream.toString())
+		return true
+	} catch (Exception e) {
+		logger.warn("zipAlign: Exception:{}", e.toString())
+	}
+	return false
+}
+
+/**
+ * Upload apk file to testfairy server
+ *
+ * @param apiKey testfairy api keyAlias
+ * @param apiFilePath apk file path to be uploaded
+ * @param mappingFilePath mapping file if it has been 'minified' 
+ * @param isSignedUpload true if this upload is locally 'resigned' instrumented apk file. 
+ * @return 'JSON' data structure parsed by JsonSlurper
+ */
+private def uploadApkToTestfairy(String apiServer, String apiKey, String apkFilePath, String mappingFilePath, boolean isSignedUpload) {
+// let apiServer configurable? 
+	def argsList = []
+	// mandatory parameters
+	argsList << "-k" 
+		argsList << "--user-agent" << "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\""
+		argsList << "-F" << "api_key=${apiKey}"
+		argsList << "-F" << "apk_file=@${apkFilePath}"
+	// conditional params... : http://docs.testfairy.com/API/Upload_API.html
+	if (mappingFilePath) {
+		argsList << "-F" << "symbols_file=@${mappingFilePath}"
+	}
+	// finally, testfairy api server + upload endpoint.
+	argsList << (isSignedUpload ? "${apiServer}/api/upload-signed" : "${apiServer}/api/upload")
+	def baos = new ByteArrayOutputStream()
+	def errOutput = new ByteArrayOutputStream()
+	try {
+		exec {
+			executable 'curl'
+			args argsList
+			standardOutput = baos
+			errorOutput = errOutput
+		}
+		// backup standard output result to curlResult
+		curlResult = baos.toString()
+		baos.reset()
+		def jsonResponse = new JsonSlurper().parseText(curlResult)
+		if (jsonResponse != null) {
+			if ("ok".equalsIgnoreCase(jsonResponse.get("status"))) {
+				return jsonResponse
+			}
+		}
+	} catch (Exception e) {
+		logger.warn("exception during uploading apk to testfairy: \n{}", e.toString())
+		logger.warn("error message: \n{}", errOutput.toString()) 
+		logger.warn("args: \n{}", argsList) 
+	}
+	return null
+}
+
+/**
+ * strip signature files - under "META-INF" of root folder of the source apk and save it to destination apk.
+ */	
+def stripSignatureFromApk(String srcApkPath, String destApkPath) {
+	ZipInputStream zipSrc = new ZipInputStream(new FileInputStream(srcApkPath))
+	ZipOutputStream zipDest = new ZipOutputStream(new FileOutputStream(destApkPath))
+	byte[] buffer = new byte[1024] 
+	try {
+		def entry = zipSrc.getNextEntry()
+		while (entry) {
+			if (!entry.name.startsWith("META-INF/")) {
+				zipDest.putNextEntry(new ZipEntry(entry))
+				int length = 0
+				while ((length = zipSrc.read(buffer)) > 0) {
+					zipDest.write(buffer, 0, length)
+				}
+				zipDest.closeEntry()
+			}
+			entry = zipSrc.getNextEntry()
+		}
+		zipDest.close()
+		zipSrc.close()
+		return true
+	} catch (Exception e) {
+		logger.warn("Exception caught during stripSignatureFromApk: \n{}", e.toString())
+	}
+	return false
+}
+
+/**
+ * Sign the given apk file with certificate from SprintDD
+ *
+ * @param apkPath apk file to be signed
+ * @param variant signed apk file downloaded from SprintDD
+ * @return 'signed' file path. null if failed.
+ */
+def signWithSprintDD(File apkFile) {
+	def apkPath = apkFile.path
+	def signedUnalignedApkPath = apkPath.replace("-unsigned", "-signed-unaligned")
+	signedUnalignedApkPath = signedUnalignedApkPath.replace(STRIP_SIGNATURE_SUFFIX,"")
+	def signedApkPath = signedUnalignedApkPath.replace("-signed-unaligned.apk", "-signed.apk")
+	// First, login to the sprint dd site.
+	def errOutput = new ByteArrayOutputStream()
+	def cookieFilePath = apkFile.parent + "/cookie-jar.txt"
+	def cookieFile = new File(cookieFilePath)
+	def validCookie = true // by default, if cookie file exists,
+	try {
+		// check whether it has cookie-jar.txt file on project folder : if it exists,
+		// don't need to log-in to get cookie. This session cookie shouldn't be expired
+		// during each buildtype(debug/release) per flavor.
+		if (cookieFile.exists()) {
+			// check validation - if created more than three hours ago, set it as invalidated
+			if (Calendar.getInstance().getTime().getTime() - cookieFile.lastModified() >  3*60*60*1000) {
+				logger.warn("Existing cookie may be expired. Refreshing it...")
+				validCookie = false
+			}
+		}
+		def argsList = []
+		if (!cookieFile.exists() || !validCookie) {
+			def credentialData = "request=insert&type=login&login=$SPRINTDD_USERNAME&password=$SPRINTDD_PASSWORD&site=main"
+			def baos = new ByteArrayOutputStream()
+			argsList << "-k" << "--cookie-jar" << cookieFilePath
+			argsList << "--user-agent"
+			argsList << "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\""
+			argsList << "--referer" 
+			argsList << "\"https://database.sprintdd.com/index.php?page=tools&tab=%23ApkSignSection\""
+			argsList << "-H" << "\"Accept: application/json\""
+			argsList << "-X" << "POST" << "-d" << credentialData
+			argsList << "https://database.sprintdd.com/include/ajax.php"
+			exec {
+				executable 'curl'
+				args argsList
+				standardOutput = baos
+				errorOutput = errOutput
+			}
+			curlResult = baos.toString() // json response should contain 'success'
+			if (!curlResult.contains("success")) {
+				validCookie = false
+				// delete the invalid cookie file and print warning about invalid credential.
+				new File(cookieFilePath).delete()
+				logger.warn("Invalid session cookie received. Did you set valid SPRINTDD_USERNAME and SPRINTDD_PASSWORD properties?")
+				logger.warn("error:" + errOutput.toString())
+			} else {
+				validCookie = true
+			}
+		}
+		if (validCookie) {
+			// Once we got a valid cookie, submit unsigned apk file to the server.
+			argsList.clear()
+			
+			exec {
+				executable 'curl'
+				args "-k", "--cookie", cookieFilePath, "--user-agent", "\"Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0\"", "--referer", "\"https://database.sprintdd.com/tools/\"","-H","DNT: 1", "-F","uploadAPK=@"+ apkPath, "-F","upload=1",\
+			"-F", "certSelect=APKSign.sprint.new",\
+			"-o", signedUnalignedApkPath, "https://database.sprintdd.com/include/sign.apk.php"
+				errorOutput = errOutput
+			}
+
+			def zipAlignPath = "$System.env.ANDROID_HOME/build-tools/$android.buildToolsVersion/zipalign"
+			exec {
+				executable zipAlignPath
+				args "-f","4",signedUnalignedApkPath, signedApkPath
+				errorOutput = errOutput
+			}
+			// remove temporary file. 
+			new File(signedUnalignedApkPath).delete()
+			return signedApkPath
+		}
+	} catch (org.gradle.process.internal.ExecException e) {  // 'curl' may not be installed on system.
+		logger.warn('ExecException occurs wihle running curl. Please verify curl installed on your system to get apk file signed by SprintDD')
+		// delete cookieFile if exists - it may be expired.
+		if (cookieFile?.exists()) {
+			cookieFile.delete()
+		}
+		logger.warn("error:"+errOutput.toString())
+		return null
+	} finally {
+		errOutput.close()
+		errOutput = null
+	}
 }
 
 /**
