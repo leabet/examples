@@ -5,6 +5,8 @@ import android.content.CursorLoader;
 import android.content.Loader;
 import android.database.Cursor;
 import android.database.DataSetObserver;
+import android.graphics.Color;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.ContactsContract;
 import android.support.design.widget.FloatingActionButton;
@@ -20,10 +22,12 @@ import android.support.v7.widget.Toolbar;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.ViewGroup;
+import android.widget.AbsListView;
 import android.widget.ListAdapter;
 import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.SimpleCursorAdapter;
+import android.widget.TextView;
 
 public class MainActivity extends AppCompatActivity
         implements NavigationView.OnNavigationItemSelectedListener , LoaderManager.LoaderCallbacks<Cursor> {
@@ -69,6 +73,13 @@ public class MainActivity extends AppCompatActivity
         ViewGroup root = (ViewGroup) findViewById(android.R.id.content);
         root.addView(progressBar);
 
+        // adding headerView.
+        TextView headerView = new TextView(this);
+        headerView.setLayoutParams(new AbsListView.LayoutParams(AbsListView.LayoutParams.MATCH_PARENT, AbsListView.LayoutParams.MATCH_PARENT));
+        headerView.setText("This is header for listview");
+        headerView.setBackgroundColor(Color.LTGRAY);
+        mListView.addHeaderView(headerView);
+
         // For the cursor adapter, specify which columns go into which views
         String[] fromColumns = {ContactsContract.Data.DISPLAY_NAME};
         int[] toViews = {android.R.id.text1}; // The TextView in simple_list_item_1
@@ -78,6 +89,9 @@ public class MainActivity extends AppCompatActivity
                 android.R.layout.simple_list_item_1, null,
                 fromColumns, toViews, 0);
         mListView.setAdapter(mAdapter);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            mListView.setNestedScrollingEnabled(true);
+        }
 
         navigationView.setNavigationItemSelectedListener(this);
     }
